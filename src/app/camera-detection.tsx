@@ -455,7 +455,7 @@ export default function CameraDetection() {
   const [selectedFrameIndices, setSelectedFrameIndices] = useState<Set<number>>(new Set());
   const [recordingFrames, setRecordingFrames] = useState(0);
   const [isTraining, setIsTraining] = useState(false);
-  const [trainingMessage, setTrainingMessage] = useState('Belum ada model terlatih.');
+  const [trainingMessage, setTrainingMessage] = useState('');
   const [databaseMessage, setDatabaseMessage] = useState('Menghubungkan ke Firebase...');
   const [modelReady, setModelReady] = useState(false);
   const [predictionScores, setPredictionScores] = useState<{ label: string; score: number }[]>([]);
@@ -504,7 +504,7 @@ export default function CameraDetection() {
               const fingerprint = fingerprintSamples(storedSamples);
               samplesFingerprintRef.current = fingerprint;
               if (!migrationFailed) {
-                setDatabaseMessage('RTDB bersama aktif tanpa login: siapa saja dapat melihat dan mengubah data.');
+                setDatabaseMessage('');
               }
               if (
                 modelRef.current &&
@@ -832,8 +832,8 @@ export default function CameraDetection() {
       setModelReady(true);
       setPredictionScores([]);
       setTrainingMessage(
-        `${hasTestSampleForEveryLabel ? 'Akurasi uji' : 'Akurasi data latih'} ${Math.round(report.accuracy * 100)}% · ${report.evaluatedSamples} rekaman, ${report.labelCount} label` +
-        (trainableLabels.length === 1 ? ' · hanya mengenali label ini.' : '.')
+        `Akurasi: ${Math.round(report.accuracy * 100)}%` +
+        (trainableLabels.length === 1 ? ' · hanya mengenali label ini.' : '')
       );
     } catch (err) {
       console.error('LSTM training failed:', err);
@@ -1325,9 +1325,6 @@ export default function CameraDetection() {
             </label>
           </div>
 
-          <p className="minimum-note">
-            Tidak ada minimal sampel atau label. Tambahkan variasi agar model lebih akurat.
-          </p>
           {samples.length > usableSamples.length && (
             <p className="minimum-note is-warning">
               {samples.length - usableSamples.length} data lama perlu direkam ulang.
@@ -1340,10 +1337,7 @@ export default function CameraDetection() {
           {trainingReport && (
             <div className="evaluation-note">
               <p>
-                {trainingReport.evaluationSource === 'training'
-                  ? 'Akurasi data latih'
-                  : 'Uji rekaman'}: {Math.round(trainingReport.accuracy * 100)}% · {trainingReport.evaluatedSamples} sampel
-                {trainingReport.evaluationSource === 'training' && ' · bukan uji terpisah'}
+                Akurasi: {Math.round(trainingReport.accuracy * 100)}% · {trainingReport.evaluatedSamples} sampel
                 {trainingReport.labelCount === 1 && ' · hanya 1 label, belum bisa membedakan gestur lain'}
               </p>
               <details>
@@ -1384,7 +1378,7 @@ export default function CameraDetection() {
                       ? 'Rekam ulang'
                       : inTrainedModel
                         ? 'Dipakai model'
-                        : 'Siap dilatih';
+                        : '';
                 return (
                   <div className="sample-entry" key={sample.id}>
                     <div className="sample-row">
