@@ -102,6 +102,15 @@ function fingerprintSamples(samples: Sample[]) {
   return `${sortedSamples.length}:${(hash >>> 0).toString(16)}`;
 }
 
+function formatSampleTimestamp(timestamp: number) {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return 'Waktu tidak diketahui';
+  return new Intl.DateTimeFormat('id-ID', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(date);
+}
+
 function openSampleDatabase() {
   return new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(DATABASE_NAME, 1);
@@ -1156,6 +1165,10 @@ export default function CameraDetection() {
     counts[sample.label] = (counts[sample.label] ?? 0) + 1;
     return counts;
   }, {});
+  const samplesByLabel = samples.reduce<Record<string, Sample[]>>((groups, sample) => {
+    (groups[sample.label] ??= []).push(sample);
+    return groups;
+  }, {});
   const canTrain = usableSamples.length > 0;
   const unsurePrediction = predictionScores.length > 0 && (
     predictionScores[0].score < MIN_RECOGNITION_SCORE ||
@@ -1358,15 +1371,20 @@ export default function CameraDetection() {
             <div className="empty-state"><p>Belum ada data. Rekam sampel pertama.</p></div>
           ) : (
             <div className="sample-list">
-              {samples.map((sample) => {
-                const sampleIsValid = isTrainableSample(sample);
-                const inTrainedModel = modelReady && labelsRef.current.includes(sample.label);
-                const trainingStatus = !sampleIsValid
-                  ? 'Rekam ulang'
-                  : inTrainedModel
-                    ? 'Dipakai model'
-                    : 'Siap dilatih';
-
+              {Object.entries(samplesByLabel).map(([groupLabel, labelSamples]) => (
+                <section className="sample-group" key={groupLabel} aria-label={`Rekaman label ${groupLabel}`}>
+                  <div className="sample-group-heading">
+                    <strong>{groupLabel}</strong>
+                    <span>{labelSamples.length} rekaman</span>
+                  </div>
+                  {labelSamples.map((sample) => {
+                    const sampleIsValid = isTrainableSample(sample);
+                    const inTrainedModel = modelReady && labelsRef.current.includes(sample.label);
+                    const trainingStatus = !sampleIsValid
+                      ? 'Rekam ulang'
+                      : inTrainedModel
+                        ? 'Dipakai model'
+                        : 'Siap dilatih';
                 return (
                   <div className="sample-entry" key={sample.id}>
                     <div className="sample-row">
@@ -1399,7 +1417,7 @@ export default function CameraDetection() {
                         </>
                       ) : (
                         <>
-                          <strong title={sample.label}>{sample.label}</strong>
+                          <time className="sample-date">{formatSampleTimestamp(sample.createdAt)}</time>
                           <span className={`sample-status${inTrainedModel ? ' is-trained' : ''}${sampleIsValid ? '' : ' is-outdated'}`}>
                             {trainingStatus}
                           </span>
@@ -1492,7 +1510,9 @@ export default function CameraDetection() {
                     )}
                   </div>
                 );
-              })}
+                  })}
+                </section>
+              ))}
             </div>
           )}
         </section>
