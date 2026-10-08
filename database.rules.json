@@ -1,0 +1,8 @@
+{
+  "rules": {
+    "samples": {
+      ".read": true,
+      ".write": true
+    }
+  }
+}
