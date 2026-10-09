@@ -449,6 +449,7 @@ export default function CameraDetection() {
   const [isInitializing, setIsInitializing] = useState(false);
   const [samples, setSamples] = useState<Sample[]>([]);
   const [label, setLabel] = useState('Halo');
+  const [sampleSearch, setSampleSearch] = useState('');
   const [editingSampleId, setEditingSampleId] = useState<string | null>(null);
   const [editingSampleLabel, setEditingSampleLabel] = useState('');
   const [editingFramesSampleId, setEditingFramesSampleId] = useState<string | null>(null);
@@ -1172,6 +1173,14 @@ export default function CameraDetection() {
     (groups[sample.label] ??= []).push(sample);
     return groups;
   }, {});
+  const normalizedSampleSearch = sampleSearch.trim().toLocaleLowerCase('id-ID');
+  const filteredSamplesByLabel = normalizedSampleSearch
+    ? Object.fromEntries(
+      Object.entries(samplesByLabel).filter(([groupLabel]) => (
+        groupLabel.toLocaleLowerCase('id-ID').includes(normalizedSampleSearch)
+      ))
+    )
+    : samplesByLabel;
   const canTrain = usableSamples.length > 0;
   const unsurePrediction = predictionScores.length > 0 && (
     predictionScores[0].score < MIN_RECOGNITION_SCORE ||
@@ -1364,11 +1373,23 @@ export default function CameraDetection() {
             <span>{samples.length} sampel · {usableSamples.length} valid · {Object.keys(labelCounts).length} label</span>
           </div>
           <p className="database-message" role="status">{databaseMessage}</p>
+          {samples.length > 0 && (
+            <input
+              className="label-input sample-search"
+              type="search"
+              value={sampleSearch}
+              onChange={(event) => setSampleSearch(event.target.value)}
+              placeholder="Cari data berdasarkan label..."
+              aria-label="Cari data latihan berdasarkan label"
+            />
+          )}
           {samples.length === 0 ? (
             <div className="empty-state"><p>Belum ada data. Rekam sampel pertama.</p></div>
+          ) : Object.keys(filteredSamplesByLabel).length === 0 ? (
+            <div className="empty-state"><p>Tidak ada data dengan label “{sampleSearch.trim()}”.</p></div>
           ) : (
             <div className="sample-list">
-              {Object.entries(samplesByLabel).map(([groupLabel, labelSamples]) => (
+              {Object.entries(filteredSamplesByLabel).map(([groupLabel, labelSamples]) => (
                 <section className="sample-group" key={groupLabel} aria-label={`Rekaman label ${groupLabel}`}>
                   <div className="sample-group-heading">
                     <strong>{groupLabel}</strong>
