@@ -1085,7 +1085,10 @@ export default function CameraDetection() {
               featureVersion: FEATURE_VERSION,
             };
             void invalidateTrainedModel().then(() => storeSample(sample)).then(() => {
-              setSamples((current) => [sample, ...current]);
+              setSamples((current) => [
+                sample,
+                ...current.filter((item) => item.id !== sample.id),
+              ].sort((left, right) => right.createdAt - left.createdAt));
               setRecordingFrames(0);
               setTrainingMessage(`Sampel "${sample.label}" tersimpan.`);
             }).catch((err: unknown) => {
