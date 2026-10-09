@@ -1379,6 +1379,9 @@ export default function CameraDetection() {
                       : inTrainedModel
                         ? 'Dipakai model'
                         : '';
+                    const allExceptFirstSelected =
+                      selectedFrameIndices.size === sample.frames.length - 1 &&
+                      sample.frames.slice(1).every((_, index) => selectedFrameIndices.has(index + 1));
                 return (
                   <div className="sample-entry" key={sample.id}>
                     <div className="sample-row">
@@ -1452,7 +1455,8 @@ export default function CameraDetection() {
                     {editingFramesSampleId === sample.id && sampleIsValid && (
                       <div className="frame-editor">
                         <p>
-                          Pratinjau menunjukkan kerangka landmark, bukan gambar kamera. Klik frame yang ingin dibuang.
+                          Pratinjau menunjukkan kerangka landmark, bukan gambar kamera. Klik frame yang ingin dibuang,
+                          atau pilih semua sekaligus (frame pertama akan disisakan).
                         </p>
                         <div className="frame-strip" role="group" aria-label={`Pilih frame yang akan dihapus dari ${sample.label}`}>
                           {sample.frames.map((frame, index) => {
@@ -1480,6 +1484,20 @@ export default function CameraDetection() {
                         </div>
                         <div className="frame-editor-actions">
                           <span>{sample.frames.length - selectedFrameIndices.size} dari {sample.frames.length} frame tersisa</span>
+                          <button
+                            className="sample-action"
+                            type="button"
+                            onClick={() => {
+                              setSelectedFrameIndices(allExceptFirstSelected
+                                ? new Set()
+                                : new Set(sample.frames.slice(1).map((_, index) => index + 1)));
+                            }}
+                            disabled={isTraining || sample.frames.length <= 1}
+                          >
+                            {allExceptFirstSelected
+                              ? 'Batal pilih semua'
+                              : 'Pilih semua (sisakan 1)'}
+                          </button>
                           <button
                             className="sample-action is-danger"
                             type="button"
