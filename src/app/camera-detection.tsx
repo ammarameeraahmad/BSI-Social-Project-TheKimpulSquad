@@ -1397,12 +1397,6 @@ export default function CameraDetection() {
                   </div>
                   {labelSamples.map((sample) => {
                     const sampleIsValid = isTrainableSample(sample);
-                    const inTrainedModel = modelReady && labelsRef.current.includes(sample.label);
-                    const trainingStatus = !sampleIsValid
-                      ? 'Rekam ulang'
-                      : inTrainedModel
-                        ? 'Dipakai model'
-                        : '';
                     const allExceptFirstSelected =
                       selectedFrameIndices.size === sample.frames.length - 1 &&
                       sample.frames.slice(1).every((_, index) => selectedFrameIndices.has(index + 1));
@@ -1418,8 +1412,8 @@ export default function CameraDetection() {
                             maxLength={48}
                             aria-label={`Nama label untuk data ${sample.label}`}
                           />
-                          <span className={`sample-status${inTrainedModel ? ' is-trained' : ''}${sampleIsValid ? '' : ' is-outdated'}`}>
-                            {trainingStatus}
+                          <span className="sample-status">
+                            {sample.frames.length} frame
                           </span>
                           <button
                             className="sample-action"
@@ -1439,8 +1433,8 @@ export default function CameraDetection() {
                       ) : (
                         <>
                           <time className="sample-date">{formatSampleTimestamp(sample.createdAt)}</time>
-                          <span className={`sample-status${inTrainedModel ? ' is-trained' : ''}${sampleIsValid ? '' : ' is-outdated'}`}>
-                            {trainingStatus}
+                          <span className="sample-status">
+                            {sample.frames.length} frame
                           </span>
                           {sampleIsValid && (
                             <button
