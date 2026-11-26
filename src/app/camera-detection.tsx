@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
 import * as tf from '@tensorflow/tfjs';
 import {
   FaceLandmarker,
@@ -9,11 +10,21 @@ import {
   type NormalizedLandmark,
   type Category,
 } from '@mediapipe/tasks-vision';
-import { onValue, ref, remove, set } from 'firebase/database';
-import { getFirebaseDatabase } from '../lib/firebase';
+import { type Database } from 'firebase/database';
+import {
+  connectPersonalFirebase,
+  getFirebaseDatabase,
+  getPersonalFirebaseDatabase,
+  publishDatabaseToCatalog,
+  unpublishDatabaseFromCatalog,
+  type PersonalFirebaseConfig,
+  type CatalogDatabaseInput,
+} from '../lib/firebase';
+import { useAuth } from '../lib/auth-context';
 
 const FRAME_COUNT = 30;
 const FEATURE_VERSION = 3;
+const FRAMES_ENCODING = 'deflate-base64-v1';
 const FACE_LANDMARK_INDICES = [
   // lips / mouth
   61, 291, 13, 14, 78, 308, 82, 312,
@@ -33,12 +44,11 @@ const FEATURE_COUNT = (FACE_POINT_COUNT + HAND_POINT_COUNT * HAND_COUNT) * 3 + 3
 const MAX_EPOCHS = 40;
 const MIN_RECOGNITION_SCORE = 0.65;
 const MIN_RECOGNITION_MARGIN = 0.15;
-const DATABASE_NAME = 'gesture-lab';
 const MODEL_KEY = 'indexeddb://gesture-lstm-v3';
 const LABELS_KEY = 'gesture-lstm-labels-v3';
 const REPORT_KEY = 'gesture-lstm-report-v3';
 const MODEL_SAMPLES_KEY = 'gesture-lstm-samples-fingerprint-v3';
-const LEGACY_MIGRATION_KEY = 'gesture-lab-firebase-migration-v1';
+const SAMPLES_KEY = 'gesture-lab-samples-cache-v1';
 const LEGACY_MODEL_KEYS = ['indexeddb://gesture-lstm-v1', 'indexeddb://gesture-lstm-v2'];
 const LEGACY_LABEL_KEYS = ['gesture-lstm-labels-v1', 'gesture-lstm-labels-v2'];
 
@@ -48,6 +58,11 @@ type Sample = {
   frames: number[][];
   createdAt: number;
   featureVersion?: number;
+};
+
+type StoredSampleRecord = Omit<Sample, 'frames'> & {
+  frames: number[][] | string;
+  framesEncoding?: string;
 };
 
 type TrainingReport = {
@@ -83,6 +98,59 @@ function isTrainableSample(sample: Sample) {
     ));
 }
 
+function isFrameArray(value: unknown): value is number[][] {
+    return Array.isArray(value) && value.every((frame) => (
+      Array.isArray(frame) &&
+      frame.every((item) => typeof item === 'number' && Number.isFinite(item))
+    ));
+}
+
+async function transformBytes(
+    bytes: Uint8Array,
+    createStream: () => CompressionStream | DecompressionStream
+) {
+    const stream = createStream();
+    const result = new Response(stream.readable).arrayBuffer();
+    const writer = stream.writable.getWriter();
+    const input = new Uint8Array(new ArrayBuffer(bytes.byteLength));
+    input.set(bytes);
+    await writer.write(input);
+    await writer.close();
+    return new Uint8Array(await result);
+}
+
+function bytesToBase64(bytes: Uint8Array) {
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    return btoa(binary);
+}
+
+async function compressFrames(frames: number[][]) {
+    const encodedFrames = new TextEncoder().encode(JSON.stringify(frames));
+    const compressed = await transformBytes(
+      encodedFrames,
+      () => new CompressionStream('deflate')
+    );
+    return bytesToBase64(compressed);
+}
+
+async function decompressFrames(encodedFrames: string) {
+    const binary = atob(encodedFrames);
+    const compressed = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const decompressed = await transformBytes(
+      compressed,
+      () => new DecompressionStream('deflate')
+    );
+    const frames: unknown = JSON.parse(new TextDecoder().decode(decompressed));
+    if (!isFrameArray(frames)) {
+      throw new Error('Data frame sampel terkompresi tidak valid.');
+    }
+    return frames;
+}
+
 function fingerprintSamples(samples: Sample[]) {
   let hash = 2166136261;
   const sortedSamples = [...samples].sort((left, right) => left.id.localeCompare(right.id));
@@ -111,80 +179,67 @@ function formatSampleTimestamp(timestamp: number) {
   }).format(date);
 }
 
-function openSampleDatabase() {
-  return new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(DATABASE_NAME, 1);
-    request.onupgradeneeded = () => {
-      request.result.createObjectStore('samples', { keyPath: 'id' });
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-async function getLegacySamples() {
-  const database = await openSampleDatabase();
-  return new Promise<Sample[]>((resolve, reject) => {
-    const transaction = database.transaction('samples', 'readonly');
-    const request = transaction.objectStore('samples').getAll();
-    request.onsuccess = () => resolve(request.result as Sample[]);
-    request.onerror = () => reject(request.error);
-    transaction.oncomplete = () => database.close();
-  });
-}
-
-function isSampleRecord(value: unknown): value is Sample {
+function isSampleRecord(value: unknown): value is StoredSampleRecord {
   if (typeof value !== 'object' || value === null) return false;
   const record = value as Record<string, unknown>;
-  return typeof record.id === 'string' &&
+  const hasValidMetadata = typeof record.id === 'string' &&
     typeof record.label === 'string' &&
     typeof record.createdAt === 'number' &&
-    (record.featureVersion === undefined || typeof record.featureVersion === 'number') &&
-    Array.isArray(record.frames) &&
-    record.frames.every((frame) => (
-      Array.isArray(frame) &&
-      frame.every((item) => typeof item === 'number' && Number.isFinite(item))
-    ));
+    (record.featureVersion === undefined || typeof record.featureVersion === 'number');
+  if (!hasValidMetadata) return false;
+
+  if (record.framesEncoding === FRAMES_ENCODING) {
+    return typeof record.frames === 'string';
+  }
+  return record.framesEncoding === undefined && isFrameArray(record.frames);
 }
 
-async function migrateLegacySamples() {
-  if (localStorage.getItem(LEGACY_MIGRATION_KEY) === 'complete') return;
-  const legacySamples = await getLegacySamples();
-  const database = getFirebaseDatabase();
-  await Promise.all(legacySamples.map((sample) => (
-    set(ref(database, `samples/${sample.id}`), sample)
-  )));
-  localStorage.setItem(LEGACY_MIGRATION_KEY, 'complete');
+async function decodeSampleRecord(record: StoredSampleRecord): Promise<Sample> {
+  let frames: number[][];
+  if (record.framesEncoding === FRAMES_ENCODING && typeof record.frames === 'string') {
+    frames = await decompressFrames(record.frames);
+  } else if (Array.isArray(record.frames)) {
+    frames = record.frames;
+  } else {
+    throw new Error('Format data sampel Firebase tidak didukung.');
+  }
+  return {
+    id: record.id,
+    label: record.label,
+    frames,
+    createdAt: record.createdAt,
+    featureVersion: record.featureVersion,
+  };
 }
 
-function watchSamples(onSamples: (samples: Sample[]) => void, onError: (error: Error) => void) {
-  const database = getFirebaseDatabase();
-  return onValue(ref(database, 'samples'), (snapshot) => {
-    const value: unknown = snapshot.val();
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-      onSamples([]);
-      return;
-    }
-
-    const samples = Object.entries(value).flatMap(([id, candidate]) => {
-      if (!isSampleRecord(candidate)) {
-        console.warn(`Ignoring invalid Firebase sample "${id}".`);
-        return [];
-      }
-      return [{ ...candidate, id }];
-    });
-    onSamples(samples);
-  }, onError);
+async function loadSamplesFromCache(): Promise<Sample[]> {
+  try {
+    const raw = localStorage.getItem(SAMPLES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const records = parsed.filter((item): item is StoredSampleRecord => isSampleRecord(item));
+    return Promise.all(records.map(decodeSampleRecord));
+  } catch (err) {
+    console.error('Could not read cached samples:', err);
+    return [];
+  }
 }
 
-async function storeSample(sample: Sample) {
-  const database = getFirebaseDatabase();
-  await set(ref(database, `samples/${sample.id}`), sample);
+function saveSamplesToCache(samples: Sample[]) {
+  localStorage.setItem(SAMPLES_KEY, JSON.stringify(samples));
 }
 
-async function removeSample(id: string) {
-  const database = getFirebaseDatabase();
-  await remove(ref(database, `samples/${id}`));
+async function storeSampleToCache(sample: Sample) {
+  const current = await loadSamplesFromCache();
+  const next = [sample, ...current.filter((item) => item.id !== sample.id)];
+  saveSamplesToCache(next);
+}
+
+async function removeSampleFromCache(id: string) {
+  const current = await loadSamplesFromCache();
+  const next = current.filter((item) => item.id !== id);
+  saveSamplesToCache(next);
 }
 
 function normalizeHandLandmarks(
@@ -443,6 +498,14 @@ function renderFramePreview(frame: number[]) {
 }
 
 export default function CameraDetection() {
+  const {
+    user,
+    signOut,
+    databaseMode,
+    personalFirebaseConfig,
+    databasePreferenceLoading,
+    setDatabasePreference,
+  } = useAuth();
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [status, setStatus] = useState('Aktifkan kamera untuk mulai.');
@@ -458,12 +521,49 @@ export default function CameraDetection() {
   const [isTraining, setIsTraining] = useState(false);
   const [trainingMessage, setTrainingMessage] = useState('');
   const [databaseMessage, setDatabaseMessage] = useState('Menghubungkan ke Firebase...');
+  const [activeDatabase, setActiveDatabase] = useState<Database | null>(null);
+  const [isDatabaseSettingsOpen, setIsDatabaseSettingsOpen] = useState(false);
+  const [settingsMode, setSettingsMode] = useState<'shared' | 'personal'>('shared');
+  const [configDraft, setConfigDraft] = useState<PersonalFirebaseConfig>({
+    apiKey: '',
+    authDomain: '',
+    appId: '',
+    projectId: '',
+    databaseURL: '',
+  });
+  const [settingsError, setSettingsError] = useState('');
+  const [isConnectingPersonalDatabase, setIsConnectingPersonalDatabase] = useState(false);
+  const [isPublishingCatalog, setIsPublishingCatalog] = useState(false);
+  const [catalogPublishError, setCatalogPublishError] = useState('');
+  const [catalogDraft, setCatalogDraft] = useState<{
+    displayName: string;
+    description: string;
+    labelCount: number;
+    sampleCount: number;
+  }>({
+    displayName: '',
+    description: '',
+    labelCount: 0,
+    sampleCount: 0,
+  });
+  const [isUnpublishingCatalog, setIsUnpublishingCatalog] = useState(false);
   const [modelReady, setModelReady] = useState(false);
   const [predictionScores, setPredictionScores] = useState<{ label: string; score: number }[]>([]);
   const [trainingReport, setTrainingReport] = useState<TrainingReport | null>(null);
   const [countdown, setCountdown] = useState(0);
   const [countdownDuration, setCountdownDuration] = useState(3);
   const [recordDuration, setRecordDuration] = useState(3);
+  const [isExporting, setIsExporting] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const [importError, setImportError] = useState('');
+  const [importResult, setImportResult] = useState<{
+    successCount: number;
+    skippedCount: number;
+    errorCount: number;
+    errors: string[];
+    importedLabels: string[];
+  } | null>(null);
+  const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
 
   const faceLandmarkerRef = useRef<FaceLandmarker | null>(null);
   const handLandmarkerRef = useRef<HandLandmarker | null>(null);
@@ -479,61 +579,37 @@ export default function CameraDetection() {
   const countdownRef = useRef(0);
   const startCameraRef = useRef<(() => void) | null>(null);
   const cameraStartingRef = useRef(false);
+  const databaseRef = useRef<Database | null>(null);
+
+  useEffect(() => {
+    if (databasePreferenceLoading) return;
+    if (databaseMode === 'personal' && !personalFirebaseConfig) {
+      databaseRef.current = null;
+      setActiveDatabase(null);
+      return;
+    }
+    try {
+      const database = databaseMode === 'personal'
+        ? getPersonalFirebaseDatabase(personalFirebaseConfig!)
+        : getFirebaseDatabase();
+      databaseRef.current = database;
+      setActiveDatabase(database);
+    } catch (err) {
+      databaseRef.current = null;
+      setActiveDatabase(null);
+    }
+  }, [databaseMode, databasePreferenceLoading, personalFirebaseConfig]);
 
   useEffect(() => {
     let disposed = false;
     let unsubscribeSamples: (() => void) | null = null;
     async function loadTrainingData() {
-      let migrationFailed = false;
-      try {
-        getFirebaseDatabase();
-        try {
-          await migrateLegacySamples();
-        } catch (err) {
-          migrationFailed = true;
-          console.error('Could not migrate local samples to Firebase:', err);
-          if (!disposed) {
-            setDatabaseMessage(
-              `Migrasi data lokal gagal: ${err instanceof Error ? err.message : 'kesalahan Firebase'}`
-            );
-          }
-        }
-        if (!disposed) {
-          unsubscribeSamples = watchSamples(
-            (storedSamples) => {
-              setSamples(storedSamples.sort((left, right) => right.createdAt - left.createdAt));
-              const fingerprint = fingerprintSamples(storedSamples);
-              samplesFingerprintRef.current = fingerprint;
-              if (!migrationFailed) {
-                setDatabaseMessage('');
-              }
-              if (
-                modelRef.current &&
-                localStorage.getItem(MODEL_SAMPLES_KEY) !== fingerprint
-              ) {
-                void invalidateTrainedModel().then(() => {
-                  setTrainingMessage('Data bersama berubah. Latih ulang model di perangkat ini.');
-                }).catch((err: unknown) => {
-                  console.error('Could not invalidate outdated local model:', err);
-                  setTrainingMessage(
-                    `Model lokal gagal diperbarui: ${err instanceof Error ? err.message : 'kesalahan penyimpanan'}`
-                  );
-                });
-              }
-            },
-            (err) => {
-              console.error('Could not read Firebase samples:', err);
-              setDatabaseMessage(`Gagal membaca Firebase: ${err.message}`);
-            }
-          );
-        }
-      } catch (err) {
-        console.error('Could not connect to Firebase Realtime Database:', err);
-        if (!disposed) {
-          setDatabaseMessage(
-            `Firebase tidak terhubung: ${err instanceof Error ? err.message : 'kesalahan konfigurasi'}`
-          );
-        }
+      if (databasePreferenceLoading) return;
+      const cached = await loadSamplesFromCache();
+      if (!disposed) {
+        setSamples(cached.sort((left, right) => right.createdAt - left.createdAt));
+        samplesFingerprintRef.current = fingerprintSamples(cached);
+        setDatabaseMessage('');
       }
 
       try {
@@ -603,9 +679,8 @@ export default function CameraDetection() {
     void loadTrainingData();
     return () => {
       disposed = true;
-      unsubscribeSamples?.();
     };
-  }, []);
+  }, [databasePreferenceLoading]);
 
   async function beginRecording() {
     const cleanLabel = label.trim();
@@ -1085,13 +1160,13 @@ export default function CameraDetection() {
               createdAt: Date.now(),
               featureVersion: FEATURE_VERSION,
             };
-            void invalidateTrainedModel().then(() => storeSample(sample)).then(() => {
+            void invalidateTrainedModel().then(() => storeSampleToCache(sample)).then(() => {
               setSamples((current) => [
                 sample,
                 ...current.filter((item) => item.id !== sample.id),
               ].sort((left, right) => right.createdAt - left.createdAt));
               setRecordingFrames(0);
-              setTrainingMessage(`Sampel "${sample.label}" tersimpan.`);
+              setTrainingMessage(`Sampel "${sample.label}" tersimpan di cache browser.`);
             }).catch((err: unknown) => {
               console.error('Could not save sample:', err);
               setRecordingFrames(0);
@@ -1212,7 +1287,7 @@ export default function CameraDetection() {
     const updatedSample = { ...sample, label: cleanLabel };
     try {
       await invalidateTrainedModel();
-      await storeSample(updatedSample);
+      await storeSampleToCache(updatedSample);
       setSamples((current) => current.map((item) => (
         item.id === sample.id ? updatedSample : item
       )));
@@ -1228,7 +1303,7 @@ export default function CameraDetection() {
     if (!window.confirm(`Hapus data "${sample.label}"?`)) return;
     try {
       await invalidateTrainedModel();
-      await removeSample(sample.id);
+      await removeSampleFromCache(sample.id);
       setSamples((current) => current.filter((item) => item.id !== sample.id));
       setTrainingMessage('Data dihapus. Latih ulang model.');
     } catch (err) {
@@ -1253,7 +1328,7 @@ export default function CameraDetection() {
     const updatedSample = { ...sample, frames: remainingFrames };
     try {
       await invalidateTrainedModel();
-      await storeSample(updatedSample);
+      await storeSampleToCache(updatedSample);
       setSamples((current) => current.map((item) => (
         item.id === sample.id ? updatedSample : item
       )));
@@ -1266,11 +1341,217 @@ export default function CameraDetection() {
     }
   }
 
+  function openDatabaseSettings() {
+    setSettingsMode(databaseMode);
+    setConfigDraft(personalFirebaseConfig ?? {
+      apiKey: '',
+      authDomain: '',
+      appId: '',
+      projectId: '',
+      databaseURL: '',
+    });
+    setSettingsError('');
+    setIsDatabaseSettingsOpen(true);
+  }
+
+  async function saveDatabaseSettings() {
+    setSettingsError('');
+    if (settingsMode === 'shared') {
+      setDatabasePreference('shared');
+      setIsDatabaseSettingsOpen(false);
+      return;
+    }
+
+    const config = {
+      apiKey: configDraft.apiKey.trim(),
+      authDomain: configDraft.authDomain.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, ''),
+      appId: configDraft.appId.trim(),
+      projectId: configDraft.projectId.trim(),
+      databaseURL: configDraft.databaseURL.trim(),
+    };
+    if (Object.values(config).some((value) => !value)) {
+      setSettingsError('Lengkapi semua konfigurasi Firebase.');
+      return;
+    }
+
+    setIsConnectingPersonalDatabase(true);
+    try {
+      await connectPersonalFirebase(config);
+      setDatabasePreference('personal', config);
+      setIsDatabaseSettingsOpen(false);
+    } catch (err) {
+      setSettingsError(`Koneksi gagal: ${err instanceof Error ? err.message : 'periksa konfigurasi dan izin Firebase.'}`);
+    } finally {
+      setIsConnectingPersonalDatabase(false);
+    }
+  }
+
+  async function handlePublishCatalog() {
+    if (!activeDatabase || !user || !personalFirebaseConfig) return;
+    setCatalogPublishError('');
+    if (!catalogDraft.displayName.trim()) {
+      setCatalogPublishError('Nama tampilan tidak boleh kosong.');
+      return;
+    }
+    if (usableSamples.length === 0) {
+      setCatalogPublishError('Tidak ada sampel valid untuk dipublikasikan.');
+      return;
+    }
+    setIsPublishingCatalog(true);
+    try {
+      const input: CatalogDatabaseInput = {
+        config: personalFirebaseConfig,
+        displayName: catalogDraft.displayName.trim(),
+        description: catalogDraft.description.trim(),
+        labelCount: Object.keys(labelCounts).length,
+        sampleCount: usableSamples.length,
+      };
+      await publishDatabaseToCatalog(
+        activeDatabase,
+        input,
+        user.uid,
+        user.displayName,
+        user.photoURL
+      );
+      setCatalogDraft({ displayName: '', description: '', labelCount: 0, sampleCount: 0 });
+      setTrainingMessage('Database dipublikasikan ke katalog!');
+    } catch (err) {
+      setCatalogPublishError(`Publikasi gagal: ${err instanceof Error ? err.message : 'periksa koneksi dan izin Firebase'}`);
+    } finally {
+      setIsPublishingCatalog(false);
+    }
+  }
+
+  async function handleExport() {
+    if (samples.length === 0) {
+      setTrainingMessage('Tidak ada data untuk diekspor.');
+      return;
+    }
+    setIsExporting(true);
+    try {
+      const exportData = samples.map((sample) => ({
+        id: sample.id,
+        label: sample.label,
+        frames: sample.frames,
+        createdAt: sample.createdAt,
+        ...(sample.featureVersion === undefined ? {} : { featureVersion: sample.featureVersion }),
+      }));
+      const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `gesture-export-${new Date().toISOString().split('T')[0]}.json`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+      setTrainingMessage(`Berhasil mengekspor ${samples.length} sampel.`);
+    } catch (err) {
+      console.error('Export failed:', err);
+      setTrainingMessage(`Ekspor gagal: ${err instanceof Error ? err.message : 'kesalahan tidak diketahui'}`);
+    } finally {
+      setIsExporting(false);
+    }
+  }
+
+  async function handleImport(file: File) {
+    setIsImporting(true);
+    setImportError('');
+    setImportResult(null);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed)) {
+        throw new Error('Format file JSON tidak valid.');
+      }
+      const existing = await loadSamplesFromCache();
+      const existingLabels = new Set(existing.map((s) => s.label));
+      const imported: Sample[] = [];
+      const skipped: string[] = [];
+      const errors: string[] = [];
+      for (const item of parsed) {
+        if (!isSampleRecord(item)) {
+          errors.push(`Melewati item tidak valid: ${JSON.stringify(item).slice(0, 80)}`);
+          continue;
+        }
+        const sample = await decodeSampleRecord(item);
+        if (existingLabels.has(sample.label)) {
+          skipped.push(sample.label);
+          continue;
+        }
+        imported.push(sample);
+        existingLabels.add(sample.label);
+      }
+      const next = [...imported, ...existing];
+      saveSamplesToCache(next);
+      setSamples(next.sort((left, right) => right.createdAt - left.createdAt));
+      setImportResult({
+        successCount: imported.length,
+        skippedCount: skipped.length,
+        errorCount: errors.length,
+        errors,
+        importedLabels: imported.map((s) => s.label),
+      });
+      if (imported.length > 0) {
+        setTrainingMessage(`Impor selesai: ${imported.length} data baru ditambahkan. Latih ulang model.`);
+        await invalidateTrainedModel();
+      } else if (skipped.length > 0) {
+        setTrainingMessage(`Impor selesai: ${skipped.length} data dilewati (label sudah ada).`);
+      } else {
+        setTrainingMessage('Impor selesai: Tidak ada data baru yang ditambahkan.');
+      }
+    } catch (err) {
+      console.error('Import failed:', err);
+      setImportError(`Impor gagal: ${err instanceof Error ? err.message : 'kesalahan tidak diketahui'}`);
+    } finally {
+      setIsImporting(false);
+    }
+  }
+
+  function openImportDialog() {
+    setImportError('');
+    setImportResult(null);
+    setIsImportDialogOpen(true);
+  }
+
+  function closeImportDialog() {
+    setIsImportDialogOpen(false);
+    setImportError('');
+    setImportResult(null);
+  }
+
   return (
     <main className="studio-shell">
       <div className="studio-layout">
         <section className="camera-column" aria-label="Kamera dan pengenalan gestur">
           <div className="camera-frame">
+            <div className="camera-header">
+              <div className="camera-title">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" style={{width: 18, height: 18}}>
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5l4 4h12a2 2 0 0 1 2 2v10z" />
+                </svg>
+                <span>Gesture Lab</span>
+              </div>
+              <div className="user-menu">
+                {user && (
+                  <>
+                    <Link href="/katalog" className="user-button katalog-link" title="Katalog Database" aria-label="Katalog Database">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" style={{width: 20, height: 20}}>
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                        <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+                      </svg>
+                    </Link>
+                    <button className="user-button" onClick={openDatabaseSettings} title="Pengaturan akun" aria-label="Pengaturan akun">
+                      {user.photoURL ? (
+                        <img src={user.photoURL} alt="" className="user-avatar" />
+                      ) : (
+                        <span className="user-avatar-placeholder">{user.displayName?.[0]?.toUpperCase() ?? 'U'}</span>
+                      )}
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
             <video ref={videoRef} className="camera-source" playsInline />
             <canvas ref={canvasRef} className="camera-output" />
             {!status.startsWith('Kamera aktif') && (
@@ -1371,6 +1652,24 @@ export default function CameraDetection() {
           <div className="dataset-heading">
             <h2 id="dataset-title">Data latihan</h2>
             <span>{samples.length} sampel · {usableSamples.length} valid · {Object.keys(labelCounts).length} label</span>
+          </div>
+          <div className="dataset-actions">
+            <button
+              className="sample-action"
+              onClick={handleExport}
+              disabled={isExporting || samples.length === 0}
+              aria-label="Ekspor data gestur ke file JSON"
+            >
+              {isExporting ? <><span className="spinner" style={{width: 14, height: 14}} /> Mengekspor...</> : 'Ekspor Data'}
+            </button>
+            <button
+              className="sample-action"
+              onClick={openImportDialog}
+              disabled={isImporting || isImportDialogOpen}
+              aria-label="Impor data gestur dari file JSON"
+            >
+              Impor Data
+            </button>
           </div>
           <p className="database-message" role="status">{databaseMessage}</p>
           {samples.length > 0 && (
@@ -1547,6 +1846,159 @@ export default function CameraDetection() {
           )}
         </section>
       </div>
+      {isDatabaseSettingsOpen && (
+        <div className="database-settings-backdrop">
+          <section className="database-settings" role="dialog" aria-modal="true" aria-labelledby="database-settings-title">
+            <div className="database-settings-heading">
+              <div>
+                <h2 id="database-settings-title">Penyimpanan data</h2>
+                <p>{user?.displayName ?? user?.email}</p>
+              </div>
+              <button className="sample-action" type="button" onClick={() => setIsDatabaseSettingsOpen(false)}>Tutup</button>
+            </div>
+            <div className="database-options" role="radiogroup" aria-label="Pilihan database">
+              <label className={`database-option${settingsMode === 'shared' ? ' is-selected' : ''}`}>
+                <input type="radio" name="database-mode" checked={settingsMode === 'shared'} onChange={() => setSettingsMode('shared')} />
+                <span><strong>Database bersama</strong><small>Gunakan data latihan bersama pengguna lain.</small></span>
+              </label>
+              <label className={`database-option${settingsMode === 'personal' ? ' is-selected' : ''}`}>
+                <input type="radio" name="database-mode" checked={settingsMode === 'personal'} onChange={() => setSettingsMode('personal')} />
+                <span><strong>Database sendiri</strong><small>Simpan data di Firebase project milik Anda.</small></span>
+              </label>
+            </div>
+            {settingsMode === 'personal' && (
+              <div className="database-config-fields">
+                <label>API key<input value={configDraft.apiKey} onChange={(event) => setConfigDraft({ ...configDraft, apiKey: event.target.value })} autoComplete="off" /></label>
+                <label>Auth domain<input value={configDraft.authDomain} onChange={(event) => setConfigDraft({ ...configDraft, authDomain: event.target.value })} placeholder="project-id.firebaseapp.com" autoComplete="off" /></label>
+                <label>App ID<input value={configDraft.appId} onChange={(event) => setConfigDraft({ ...configDraft, appId: event.target.value })} autoComplete="off" /></label>
+                <label>Project ID<input value={configDraft.projectId} onChange={(event) => setConfigDraft({ ...configDraft, projectId: event.target.value })} autoComplete="off" /></label>
+                <label>Realtime Database URL<input value={configDraft.databaseURL} onChange={(event) => setConfigDraft({ ...configDraft, databaseURL: event.target.value })} placeholder="https://project-id-default-rtdb..." autoComplete="off" /></label>
+                <p className="database-config-note">Akun Google akan diminta untuk masuk ke Firebase project tersebut. Aktifkan Google Authentication dan izinkan akses baca/tulis `/samples` melalui Rules.</p>
+              </div>
+            )}
+            {settingsMode === 'personal' && activeDatabase && personalFirebaseConfig && (
+              <div className="database-catalog-section">
+                <h3 className="database-catalog-title">Publikasikan ke Katalog</h3>
+                <p className="database-config-note">Bagikan database ini ke katalog publik agar pengguna lain dapat menemukan dan menggunakannya.</p>
+                <div className="catalog-publish-form">
+                  <label>
+                    <span>Nama Tampilan</span>
+                    <input
+                      type="text"
+                      className="label-input"
+                      value={catalogDraft.displayName}
+                      onChange={(event) => setCatalogDraft({ ...catalogDraft, displayName: event.target.value })}
+                      placeholder="Contoh: Database Gestur Bahasa Isyarat"
+                      maxLength={64}
+                      autoComplete="off"
+                    />
+                  </label>
+                  <label>
+                    <span>Deskripsi</span>
+                    <textarea
+                      className="label-input"
+                      value={catalogDraft.description}
+                      onChange={(event) => setCatalogDraft({ ...catalogDraft, description: event.target.value })}
+                      placeholder="Jelaskan isi database ini (label apa saja, untuk siapa, dll.)"
+                      maxLength={280}
+                      rows={3}
+                      style={{ resize: 'vertical' }}
+                    />
+                  </label>
+                  <div className="catalog-publish-preview">
+                    <strong>Pratinjau:</strong>
+                    <div className="catalog-preview-stats">
+                      <span>{usableSamples.length} sampel valid</span>
+                      <span>{Object.keys(labelCounts).length} label</span>
+                    </div>
+                  </div>
+                  {catalogPublishError && <p className="database-settings-error" role="alert">{catalogPublishError}</p>}
+                  <div className="catalog-publish-actions">
+                    <button
+                      className="train-button"
+                      type="button"
+                      onClick={handlePublishCatalog}
+                      disabled={isPublishingCatalog || !catalogDraft.displayName.trim() || usableSamples.length === 0}
+                    >
+                      {isPublishingCatalog ? 'Memublikasikan...' : 'Publikasikan ke Katalog'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+            {settingsError && <p className="database-settings-error" role="alert">{settingsError}</p>}
+            <div className="database-settings-actions">
+              <button className="sample-action" type="button" onClick={() => void signOut()}>Keluar</button>
+              <button className="train-button" type="button" onClick={() => void saveDatabaseSettings()} disabled={isConnectingPersonalDatabase}>
+                {isConnectingPersonalDatabase ? 'Menghubungkan...' : settingsMode === 'personal' ? 'Hubungkan & simpan' : 'Simpan pilihan'}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+      {isImportDialogOpen && (
+        <div className="database-settings-backdrop" onClick={closeImportDialog}>
+          <section className="database-settings" role="dialog" aria-modal="true" aria-labelledby="import-dialog-title" onClick={(e) => e.stopPropagation()}>
+            <div className="database-settings-heading">
+              <div>
+                <h2 id="import-dialog-title">Impor Data Gestur</h2>
+                <p>Pilih file JSON hasil ekspor untuk menambahkan data latihan baru.</p>
+              </div>
+              <button className="sample-action" type="button" onClick={closeImportDialog}>Tutup</button>
+            </div>
+            <div className="database-config-fields">
+              <label>
+                <span>File JSON</span>
+                <input
+                  type="file"
+                  accept=".json"
+                  className="label-input"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) void handleImport(file);
+                  }}
+                  disabled={isImporting}
+                />
+                <small>Format: file JSON dari fitur ekspor. Data dengan label yang sudah ada akan dilewati.</small>
+              </label>
+              {importError && <p className="database-settings-error" role="alert">{importError}</p>}
+              {importResult && (
+                <div className="catalog-publish-preview" style={{marginTop: 12}}>
+                  <strong>Hasil Impor:</strong>
+                  <div className="catalog-preview-stats">
+                    <span>{importResult.successCount} ditambahkan</span>
+                    <span>{importResult.skippedCount} dilewati</span>
+                    <span>{importResult.errorCount} gagal</span>
+                  </div>
+                  {importResult.importedLabels.length > 0 && (
+                    <div style={{marginTop: 8, fontSize: '0.875rem', color: 'var(--text-muted)'}}>
+                      Label baru: {importResult.importedLabels.join(', ')}
+                    </div>
+                  )}
+                  {importResult.errors.length > 0 && (
+                    <details style={{marginTop: 8, fontSize: '0.875rem'}}>
+                      <summary>Detail kesalahan ({importResult.errorCount})</summary>
+                      <ul style={{marginTop: 4, paddingLeft: 20}}>
+                        {importResult.errors.slice(0, 5).map((error, index) => (
+                          <li key={`${index}-${error}`}>{error}</li>
+                        ))}
+                      </ul>
+                      {importResult.errorCount > 5 && (
+                        <small>{importResult.errorCount - 5} kesalahan lainnya tidak ditampilkan.</small>
+                      )}
+                    </details>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="database-settings-actions">
+              <button className="sample-action" type="button" onClick={closeImportDialog}>
+                {importResult ? 'Selesai' : 'Batal'}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
